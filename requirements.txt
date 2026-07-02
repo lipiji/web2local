@@ -1,0 +1,32 @@
+# Core scraping engine (includes curl_cffi, trafilatura, patchright)
+web4agent[all]
+
+# TLS/JA3 fingerprint impersonation for binary downloads
+curl_cffi
+
+# Cloudflare bypass (sync, wrapped in executor)
+cloudscraper
+
+# Realistic user-agent rotation
+fake-useragent
+
+# Async HTTP (fallback / HEAD requests)
+httpx
+
+# Async file I/O
+aiofiles
+
+# URL queue persistence
+aiosqlite
+
+# HTML parsing for link extraction
+beautifulsoup4
+lxml
+
+# CLI
+click
+python-dotenv
+
+# Testing
+pytest
+pytest-asyncio

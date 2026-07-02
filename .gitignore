@@ -1,0 +1,51 @@
+# Crawl output and queue (often large, regenerable)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.cover
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Playwright / patchright browser binaries
+.playwright/
+ms-playwright/
+
+# Logs
+*.log
+logs/
