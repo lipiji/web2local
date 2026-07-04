@@ -47,6 +47,13 @@ class Config:
         "doubleclick.net",
         "ads.google.com",
         "googleadservices.com",
+        # Consistently blocks scrapers with 403
+        "baike.baidu.com",
+        "tieba.baidu.com",
+        "wenku.baidu.com",
+        # Ad/tracking noise
+        "adservice.google.com",
+        "pagead2.googlesyndication.com",
     )
 
     @classmethod

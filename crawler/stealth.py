@@ -1,13 +1,9 @@
 """
-Anti-detection layer for human-like web crawling.
-
-Key techniques:
-- Per-domain rate limiting with Gaussian-distributed delays
-- Realistic Chrome request headers (Sec-Fetch-*, Sec-CH-UA, etc.)
-- User-agent rotation via fake-useragent
-- Referer chain tracking per domain
-- Retry with exponential backoff + jitter
-- Cloudflare bypass via cloudscraper (sync, run in thread executor)
+Anti-detection layer:
+- AdaptiveDomainRateLimiter: loosens on success, tightens on 429/error
+- HeaderBuilder: realistic Chrome headers with UA rotation
+- with_retry: exponential backoff + jitter
+- cloudscraper_get: Cloudflare bypass in thread executor
 """
 
 import asyncio
@@ -47,45 +43,67 @@ _FALLBACK_UA = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Gaussian delay helper
-# ---------------------------------------------------------------------------
-
 def _gauss_clamp(min_s: float, max_s: float) -> float:
+    if max_s <= min_s:
+        return min_s
     mean = (min_s + max_s) / 2
     std = (max_s - min_s) / 4
     return max(min_s, min(max_s, random.gauss(mean, std)))
 
 
 # ---------------------------------------------------------------------------
-# Per-domain rate limiter
+# Adaptive per-domain rate limiter
 # ---------------------------------------------------------------------------
 
-class DomainRateLimiter:
+class AdaptiveDomainRateLimiter:
     """
-    Enforces a human-like minimum gap between successive requests to the
-    same domain, drawn from a Gaussian distribution so timing is not
-    mechanically regular.
+    Per-domain rate limiter that self-adjusts based on outcomes:
+    - Success → gradually decrease delay toward min_delay
+    - 429 / connection error → double delay, up to max_delay × 4
+    - Different domains never block each other
     """
 
     def __init__(self, min_delay: float = 1.5, max_delay: float = 5.0) -> None:
         self._min = min_delay
         self._max = max_delay
+        self._current: dict[str, float] = defaultdict(lambda: min_delay)
         self._last: dict[str, float] = defaultdict(float)
-        # One lock per domain prevents concurrent bursts
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
+    def _domain(self, url: str) -> str:
+        return urlparse(url).netloc
+
     async def wait(self, url: str) -> None:
-        domain = urlparse(url).netloc
+        domain = self._domain(url)
         lock = self._locks[domain]
         async with lock:
             elapsed = time.monotonic() - self._last[domain]
-            needed = _gauss_clamp(self._min, self._max)
-            gap = needed - elapsed
+            delay = _gauss_clamp(self._current[domain] * 0.9, self._current[domain] * 1.1)
+            gap = delay - elapsed
             if gap > 0:
-                log.debug("Rate-limit %s: sleep %.2fs", domain, gap)
+                log.debug("Rate-limit %s: %.2fs", domain, gap)
                 await asyncio.sleep(gap)
             self._last[domain] = time.monotonic()
+
+    def on_success(self, url: str) -> None:
+        """Nudge delay 5% down on each success (floor: min_delay)."""
+        d = self._domain(url)
+        self._current[d] = max(self._min, self._current[d] * 0.95)
+
+    def on_error(self, url: str, exc: Exception) -> None:
+        """
+        Double delay on retriable errors (429, connection issues).
+        Caps at max_delay × 4 so we don't wait forever.
+        """
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 429 or "ConnectionError" in type(exc).__name__ or "Timeout" in type(exc).__name__:
+            d = self._domain(url)
+            self._current[d] = min(self._max * 4, self._current[d] * 2.0)
+            log.debug("Backed off %s to %.1fs", d, self._current[d])
+
+
+# Keep the original name as an alias for backward compatibility with tests
+DomainRateLimiter = AdaptiveDomainRateLimiter
 
 
 # ---------------------------------------------------------------------------
@@ -93,19 +111,13 @@ class DomainRateLimiter:
 # ---------------------------------------------------------------------------
 
 class HeaderBuilder:
-    """
-    Generates browser-authentic request headers including Sec-Fetch-* and
-    Sec-CH-UA Client Hints that modern Chromium sends on every navigation.
-    Uses fake-useragent for UA rotation; falls back to a hardcoded string.
-    """
-
     def __init__(self) -> None:
         self._ua_gen = None
         try:
             from fake_useragent import UserAgent
             self._ua_gen = UserAgent(browsers=["chrome", "edge"])
         except Exception as exc:
-            log.warning("fake-useragent unavailable, using fallback UA: %s", exc)
+            log.warning("fake-useragent unavailable: %s", exc)
 
     def random_ua(self) -> str:
         if self._ua_gen:
@@ -123,7 +135,7 @@ class HeaderBuilder:
         ua: Optional[str] = None,
     ) -> dict[str, str]:
         ua = ua or self.random_ua()
-        brand, ver = random.choice(_CHROME_BRANDS)
+        brand, _ = random.choice(_CHROME_BRANDS)
         headers: dict[str, str] = {
             "User-Agent": ua,
             "Accept": "*/*" if binary else _ACCEPT_HTML,
@@ -135,7 +147,6 @@ class HeaderBuilder:
             headers["Upgrade-Insecure-Requests"] = "1"
             headers["Cache-Control"] = "max-age=0"
 
-        # Client Hints + Sec-Fetch-* for Chromium UAs
         if "Chrome" in ua or "Edg" in ua:
             headers.update({
                 "Sec-Fetch-Dest": "empty" if binary else "document",
@@ -157,7 +168,11 @@ class HeaderBuilder:
 # Retry helper
 # ---------------------------------------------------------------------------
 
-_RETRIABLE_CURL_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+_RETRIABLE_NAMES = frozenset({
+    "ConnectionError", "ConnectError", "TimeoutError",
+    "RemoteProtocolError", "ReadTimeout", "ConnectTimeout",
+})
+_RETRIABLE_HTTP = frozenset({429, 500, 502, 503, 504})
 
 
 async def with_retry(
@@ -165,48 +180,30 @@ async def with_retry(
     *,
     max_retries: int = 3,
     base_delay: float = 2.0,
-    retriable_http: frozenset[int] = _RETRIABLE_CURL_CODES,
 ) -> any:
-    """
-    Retry `await coro_factory()` up to max_retries times on transient errors.
-    Uses exponential backoff with random jitter to avoid thundering herd.
-    """
+    """Retry with exponential backoff + ±50 % random jitter."""
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
             return await coro_factory()
         except Exception as exc:
-            # Check for HTTP status errors from curl_cffi or httpx
             status = getattr(getattr(exc, "response", None), "status_code", None)
-            is_retriable = (
-                status in retriable_http
-                or "ConnectionError" in type(exc).__name__
-                or "TimeoutError" in type(exc).__name__
-                or "RemoteProtocol" in type(exc).__name__
-                or "ConnectError" in type(exc).__name__
-            )
-            if not is_retriable or attempt == max_retries:
+            name = type(exc).__name__
+            retriable = status in _RETRIABLE_HTTP or any(n in name for n in _RETRIABLE_NAMES)
+            if not retriable or attempt == max_retries:
                 raise
             last_exc = exc
             delay = min(base_delay * (2 ** attempt) + random.uniform(0.5, 2.0), 60.0)
-            log.debug(
-                "Retry %d/%d in %.1fs (%s)",
-                attempt + 1, max_retries, delay, type(exc).__name__,
-            )
+            log.debug("Retry %d/%d in %.1fs (%s)", attempt + 1, max_retries, delay, name)
             await asyncio.sleep(delay)
     raise last_exc  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
-# Cloudflare bypass (sync cloudscraper, run in executor)
+# Cloudflare bypass via cloudscraper (sync, wrapped in thread executor)
 # ---------------------------------------------------------------------------
 
 async def cloudscraper_get(url: str, headers: dict[str, str], timeout: int = 30) -> bytes:
-    """
-    Fetch `url` via cloudscraper (synchronous Cloudflare JS-challenge solver)
-    wrapped in a thread executor so it doesn't block the event loop.
-    Returns raw response bytes.
-    """
     def _sync() -> bytes:
         import cloudscraper  # type: ignore[import]
         scraper = cloudscraper.create_scraper(

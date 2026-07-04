@@ -1,7 +1,12 @@
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
+
+# Force UTF-8 I/O on Windows — prevents crawl4ai GBK encoding errors
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 import click
 from dotenv import load_dotenv
@@ -36,6 +41,10 @@ def cli() -> None:
 @click.option("--db", default="./crawl.db", show_default=True, help="SQLite queue database")
 @click.option("--follow-links/--no-follow-links", default=True, show_default=True)
 @click.option("--same-domain/--all-domains", default=False, show_default=True)
+@click.option("--min-delay", default=1.5, show_default=True,
+              help="Min seconds between requests to same domain (Gaussian lower bound)")
+@click.option("--max-delay", default=5.0, show_default=True,
+              help="Max seconds between requests to same domain (Gaussian upper bound)")
 def crawl(
     keyword: str,
     output: str,
@@ -46,6 +55,8 @@ def crawl(
     db: str,
     follow_links: bool,
     same_domain: bool,
+    min_delay: float,
+    max_delay: float,
 ) -> None:
     """Crawl the web for KEYWORD and save all relevant files locally."""
     config = Config(
@@ -57,6 +68,8 @@ def crawl(
         search_max_results=search_results,
         follow_links=follow_links,
         same_domain_only=same_domain,
+        min_delay=min_delay,
+        max_delay=max_delay,
     )
     asyncio.run(_run(keyword, config))
 

@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import random
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -50,6 +51,14 @@ class URLQueue:
     async def initialize(self) -> None:
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
+        # WAL mode: allows concurrent reads while writes happen; dramatically
+        # reduces write contention under high concurrency.
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        # NORMAL sync is safe with WAL and avoids per-commit fsync() overhead.
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+        # 40 MB in-memory page cache to avoid repeated disk reads.
+        await self._db.execute("PRAGMA cache_size=-40000")
+        await self._db.execute("PRAGMA temp_store=MEMORY")
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
 
@@ -110,11 +119,35 @@ class URLQueue:
     # ------------------------------------------------------------------
 
     async def get_batch(self, n: int = 10) -> list[QueueItem]:
-        """Claim up to n pending URLs (sets status → in_progress)."""
+        """Claim up to n pending URLs in ROWID order (fast, sequential)."""
         async with self._db.execute(
             "SELECT url, topic, depth FROM urls WHERE status='pending' LIMIT ?", (n,)
         ) as cur:
             rows = await cur.fetchall()
+        return await self._mark_in_progress(rows)
+
+    async def get_batch_diverse(self, n: int) -> list[QueueItem]:
+        """
+        Claim n pending URLs with domain diversity.
+
+        Fetches 3× oversample then Python-shuffles before marking in_progress.
+        This spreads workers across different domains without expensive SQL sorting,
+        so the rate limiter has less contention and concurrency is maximised.
+        """
+        oversample = min(n * 3, 300)
+        async with self._db.execute(
+            "SELECT url, topic, depth FROM urls WHERE status='pending' LIMIT ?",
+            (oversample,),
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            return []
+        rows_list = list(rows)
+        random.shuffle(rows_list)
+        selected = rows_list[:n]
+        return await self._mark_in_progress(selected)
+
+    async def _mark_in_progress(self, rows) -> list[QueueItem]:
         if not rows:
             return []
         await self._db.executemany(

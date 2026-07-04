@@ -1,10 +1,9 @@
 """
-Binary file downloader with anti-detection measures:
-- curl_cffi for TLS/JA3 fingerprint impersonation (mimics real Chrome)
+Binary file downloader:
+- curl_cffi AsyncSession pool (one per impersonation target) for connection reuse
 - Realistic browser headers via HeaderBuilder
-- Per-domain rate limiting (injected as optional parameter)
-- Retry with exponential backoff + jitter
-- cloudscraper fallback on Cloudflare 403 responses
+- Per-domain rate limiting + adaptive backoff
+- cloudscraper fallback on Cloudflare 403/503
 """
 
 import logging
@@ -12,7 +11,12 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from config import EXT_CATEGORY
-from crawler.stealth import DomainRateLimiter, HeaderBuilder, cloudscraper_get, with_retry
+from crawler.stealth import (
+    AdaptiveDomainRateLimiter,
+    HeaderBuilder,
+    cloudscraper_get,
+    with_retry,
+)
 
 log = logging.getLogger(__name__)
 
@@ -35,28 +39,47 @@ _MIME_TO_EXT: dict[str, str] = {
     "image/tiff": ".tiff",
 }
 
-# Chromium impersonation targets supported by curl_cffi
-_IMPERSONATE_TARGETS = ["chrome124", "chrome123", "chrome110", "edge99"]
+# Rotation pool — each entry keeps its own connection pool alive
+_IMPERSONATE_POOL = ["chrome124", "chrome123", "chrome110", "edge99"]
 
 _header_builder = HeaderBuilder()
 
+# Shared sessions: one per impersonation target, created lazily
+_sessions: dict[str, "AsyncSession"] = {}  # type: ignore[type-arg]
+_sessions_lock: "asyncio.Lock | None" = None
+
+
+def _get_sessions_lock():
+    import asyncio
+    global _sessions_lock
+    if _sessions_lock is None:
+        _sessions_lock = asyncio.Lock()
+    return _sessions_lock
+
+
+async def _get_session(impersonate: str):
+    """Return a shared AsyncSession for the given impersonation target."""
+    if impersonate not in _sessions:
+        async with _get_sessions_lock():
+            if impersonate not in _sessions:
+                from curl_cffi.requests import AsyncSession  # type: ignore[import]
+                _sessions[impersonate] = AsyncSession(impersonate=impersonate)
+    return _sessions[impersonate]
+
 
 def url_ext(url: str) -> str:
-    """Return lowercase file extension from URL path, e.g. '.pdf'."""
     path = urlparse(url).path
     last = path.rstrip("/").split("/")[-1]
     return ("." + last.rsplit(".", 1)[-1].lower()) if "." in last else ""
 
 
 def classify_url(url: str) -> tuple[Optional[str], Optional[str]]:
-    """Return (ext, category) if URL points to a downloadable binary, else (None, None)."""
     ext = url_ext(url)
     cat = EXT_CATEGORY.get(ext)
     return (ext, cat) if cat else (None, None)
 
 
 def classify_mime(content_type: str) -> tuple[Optional[str], Optional[str]]:
-    """Return (ext, category) from a Content-Type header value."""
     mime = content_type.split(";")[0].strip().lower()
     ext = _MIME_TO_EXT.get(mime)
     if not ext:
@@ -65,53 +88,53 @@ def classify_mime(content_type: str) -> tuple[Optional[str], Optional[str]]:
     return (ext, cat) if cat else (None, None)
 
 
-def _is_cloudflare_block(status: int, body: bytes) -> bool:
+def _is_cloudflare(status: int, body: bytes) -> bool:
+    snippet = body[:2048].lower()
     return status in {403, 503} and (
-        b"cloudflare" in body[:2048].lower()
-        or b"cf-ray" in body[:2048].lower()
-        or b"just a moment" in body[:2048].lower()
+        b"cloudflare" in snippet or b"cf-ray" in snippet or b"just a moment" in snippet
     )
+
+
+import random as _random
 
 
 async def download_binary(
     url: str,
     timeout: int = 30,
-    rate_limiter: Optional[DomainRateLimiter] = None,
+    rate_limiter: Optional[AdaptiveDomainRateLimiter] = None,
     referer: Optional[str] = None,
 ) -> tuple[bytes, str, str]:
     """
     Download a binary file.
-    Strategy: curl_cffi (TLS impersonation) → cloudscraper (Cloudflare bypass).
+    Strategy: shared curl_cffi session (TLS impersonation) → cloudscraper fallback.
     Returns (content_bytes, resolved_ext, content_type_header).
     """
     if rate_limiter:
         await rate_limiter.wait(url)
 
-    impersonate = _IMPERSONATE_TARGETS[0]
+    impersonate = _random.choice(_IMPERSONATE_POOL)
     headers = _header_builder.build(binary=True, referer=referer)
 
-    async def _curl_fetch() -> tuple[bytes, str, str]:
-        from curl_cffi.requests import AsyncSession  # type: ignore[import]
+    async def _fetch() -> tuple[bytes, str, str]:
+        session = await _get_session(impersonate)
+        resp = await session.get(
+            url, headers=headers, timeout=timeout, allow_redirects=True
+        )
+        body = resp.content
+        status = resp.status_code
 
-        async with AsyncSession(impersonate=impersonate) as session:
-            resp = await session.get(
-                url, headers=headers, timeout=timeout, allow_redirects=True
-            )
-            body = resp.content
-            status = resp.status_code
+        if _is_cloudflare(status, body):
+            log.debug("Cloudflare block on %s — cloudscraper fallback", url)
+            body = await cloudscraper_get(url, headers, timeout)
+            ct = ""
+        else:
+            if status >= 400:
+                raise Exception(f"HTTP {status} from {url}")
+            ct = resp.headers.get("content-type", "")
 
-            if _is_cloudflare_block(status, body):
-                log.debug("Cloudflare block on %s — trying cloudscraper", url)
-                body = await cloudscraper_get(url, headers, timeout)
-                ct = ""
-            else:
-                if status >= 400:
-                    raise Exception(f"HTTP {status}")
-                ct = resp.headers.get("content-type", "")
+        ext_from_mime, _ = classify_mime(ct)
+        ext = ext_from_mime or url_ext(url) or ".bin"
+        log.debug("Downloaded %d bytes from %s (ext=%s)", len(body), url, ext)
+        return body, ext, ct
 
-            ext_from_mime, _ = classify_mime(ct)
-            ext = ext_from_mime or url_ext(url) or ".bin"
-            log.debug("Downloaded %d bytes from %s (ext=%s)", len(body), url, ext)
-            return body, ext, ct
-
-    return await with_retry(_curl_fetch)
+    return await with_retry(_fetch)

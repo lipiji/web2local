@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from crawler.stealth import DomainRateLimiter, HeaderBuilder, with_retry
+from crawler.stealth import AdaptiveDomainRateLimiter as DomainRateLimiter, HeaderBuilder, with_retry
 
 
 # ---------------------------------------------------------------------------
