@@ -1,8 +1,9 @@
+import asyncio
 import json
 
 import pytest
 
-from storage.local_store import LocalStore, _md5, _slugify, _url_to_filename
+from storage.local_store import LocalStore, _content_hash, _slugify, _url_to_filename
 
 
 # ------------------------------------------------------------------
@@ -41,9 +42,14 @@ def test_url_to_filename_long_path_truncated():
     assert len(name) <= 100
 
 
-def test_md5_consistency():
-    assert _md5("hello") == _md5("hello")
-    assert _md5("hello") != _md5("world")
+def test_content_hash_consistency():
+    assert _content_hash("hello") == _content_hash("hello")
+    assert _content_hash("hello") != _content_hash("world")
+
+
+def test_content_hash_is_sha256_length():
+    # SHA-256 hex digest is always 64 characters
+    assert len(_content_hash("hello")) == 64
 
 
 # ------------------------------------------------------------------
@@ -112,3 +118,18 @@ async def test_log_metadata_appends(store):
     await store.log_metadata({"url": "https://b.com"})
     lines = store._meta_file.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
+
+
+async def test_log_metadata_concurrent_writes_stay_valid_jsonl(store):
+    """Regression test: concurrent workers appending to the same file must
+    never interleave partial lines (each line must remain valid JSON)."""
+
+    async def write(i: int) -> None:
+        await store.log_metadata({"url": f"https://x.com/{i}", "i": i})
+
+    await asyncio.gather(*(write(i) for i in range(50)))
+
+    lines = store._meta_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 50
+    parsed = [json.loads(line) for line in lines]  # raises if any line is corrupted
+    assert {p["i"] for p in parsed} == set(range(50))

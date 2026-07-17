@@ -60,6 +60,11 @@ class URLQueue:
         await self._db.execute("PRAGMA cache_size=-40000")
         await self._db.execute("PRAGMA temp_store=MEMORY")
         await self._db.executescript(_SCHEMA)
+        # Recover from a crash/kill mid-crawl: any row stuck in_progress from a
+        # previous run has no worker left to finish it, so it must be retried.
+        await self._db.execute(
+            "UPDATE urls SET status='pending' WHERE status='in_progress'"
+        )
         await self._db.commit()
 
     async def close(self) -> None:
@@ -119,24 +124,30 @@ class URLQueue:
     # ------------------------------------------------------------------
 
     async def get_batch(self, n: int = 10) -> list[QueueItem]:
-        """Claim up to n pending URLs in ROWID order (fast, sequential)."""
+        """Atomically claim up to n pending URLs in ROWID order (fast, sequential)."""
         async with self._db.execute(
-            "SELECT url, topic, depth FROM urls WHERE status='pending' LIMIT ?", (n,)
+            "UPDATE urls SET status='in_progress' "
+            "WHERE id IN (SELECT id FROM urls WHERE status='pending' ORDER BY id LIMIT ?) "
+            "RETURNING url, topic, depth",
+            (n,),
         ) as cur:
             rows = await cur.fetchall()
-        return await self._mark_in_progress(rows)
+        await self._db.commit()
+        return [QueueItem(url=r["url"], topic=r["topic"], depth=r["depth"]) for r in rows]
 
     async def get_batch_diverse(self, n: int) -> list[QueueItem]:
         """
         Claim n pending URLs with domain diversity.
 
-        Fetches 3× oversample then Python-shuffles before marking in_progress.
+        Fetches 3× oversample then Python-shuffles, then claims the chosen rows
+        with a single atomic UPDATE ... RETURNING (guarded by status='pending'
+        so a row can't be claimed twice even under concurrent callers).
         This spreads workers across different domains without expensive SQL sorting,
         so the rate limiter has less contention and concurrency is maximised.
         """
         oversample = min(n * 3, 300)
         async with self._db.execute(
-            "SELECT url, topic, depth FROM urls WHERE status='pending' LIMIT ?",
+            "SELECT id, url, topic, depth FROM urls WHERE status='pending' LIMIT ?",
             (oversample,),
         ) as cur:
             rows = await cur.fetchall()
@@ -144,18 +155,22 @@ class URLQueue:
             return []
         rows_list = list(rows)
         random.shuffle(rows_list)
-        selected = rows_list[:n]
-        return await self._mark_in_progress(selected)
-
-    async def _mark_in_progress(self, rows) -> list[QueueItem]:
-        if not rows:
-            return []
-        await self._db.executemany(
-            "UPDATE urls SET status='in_progress' WHERE url=?",
-            [(r["url"],) for r in rows],
+        selected_ids = [r["id"] for r in rows_list[:n]]
+        # placeholders is a run of literal "?" chars sized to selected_ids;
+        # actual values are bound via the parameter tuple below, not spliced in.
+        placeholders = ",".join("?" * len(selected_ids))
+        query = (
+            f"UPDATE urls SET status='in_progress' "  # nosec B608
+            f"WHERE id IN ({placeholders}) AND status='pending' "
+            f"RETURNING url, topic, depth"
         )
+        async with self._db.execute(
+            query,
+            tuple(selected_ids),
+        ) as cur:
+            claimed = await cur.fetchall()
         await self._db.commit()
-        return [QueueItem(url=r["url"], topic=r["topic"], depth=r["depth"]) for r in rows]
+        return [QueueItem(url=r["url"], topic=r["topic"], depth=r["depth"]) for r in claimed]
 
     async def is_seen(self, url: str) -> bool:
         h = _sha256(url)
@@ -163,6 +178,21 @@ class URLQueue:
             "SELECT 1 FROM urls WHERE url_hash=?", (h,)
         ) as cur:
             return await cur.fetchone() is not None
+
+    async def is_seen_many(self, urls: list[str]) -> set[str]:
+        """Return the subset of `urls` already present in the queue (batched, avoids N+1)."""
+        if not urls:
+            return set()
+        hash_to_url = {_sha256(u): u for u in urls}
+        # placeholders is a run of literal "?" chars sized to hash_to_url;
+        # actual values are bound via the parameter tuple below, not spliced in.
+        placeholders = ",".join("?" * len(hash_to_url))
+        async with self._db.execute(
+            f"SELECT url_hash FROM urls WHERE url_hash IN ({placeholders})",  # nosec B608
+            tuple(hash_to_url.keys()),
+        ) as cur:
+            rows = await cur.fetchall()
+        return {hash_to_url[r["url_hash"]] for r in rows}
 
     async def pending_count(self) -> int:
         async with self._db.execute(

@@ -88,6 +88,7 @@ async def test_download_binary_marks_failed_on_error(config, queue, store, noop_
 
     with (
         patch("crawler.engine.download_binary", new_callable=AsyncMock) as mock_dl,
+        patch("crawler.engine.is_safe_url", new_callable=AsyncMock, return_value=True),
         patch.object(queue, "mark_failed", new_callable=AsyncMock) as mock_fail,
     ):
         mock_dl.side_effect = Exception("network error")

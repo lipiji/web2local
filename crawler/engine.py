@@ -20,6 +20,7 @@ from web4agent import read_url
 
 from config import Config
 from crawler.downloader import classify_mime, classify_url, download_binary
+from crawler.security import is_safe_url
 from crawler.stealth import AdaptiveDomainRateLimiter, HeaderBuilder, with_retry
 from url_queue.url_queue import QueueItem, URLQueue
 from sources.search import get_arxiv_urls, get_seed_urls, get_bing_urls
@@ -159,7 +160,7 @@ class CrawlEngine:
 
         ddg_results, arxiv_urls, bing_urls = await asyncio.gather(
             get_seed_urls(keyword, self._cfg.search_max_results),
-            get_arxiv_urls(keyword, max_results=10),
+            get_arxiv_urls(keyword, max_results=self._cfg.arxiv_max_results),
             get_bing_urls(keyword, max_results=self._cfg.search_max_results),
             return_exceptions=True,
         )
@@ -198,6 +199,11 @@ class CrawlEngine:
 
     async def _process(self, item: QueueItem) -> None:
         url, topic, depth = item
+        if not await is_safe_url(url):
+            log.warning("Blocked unsafe URL (SSRF guard): %s", url)
+            await self._queue.mark_failed(url, "blocked: unsafe target address")
+            return
+
         ext, cat = classify_url(url)
         referer = self._referers.get(url)
         try:
@@ -214,7 +220,11 @@ class CrawlEngine:
     ) -> None:
         try:
             content, actual_ext, _ct = await download_binary(
-                url, self._cfg.timeout, rate_limiter=self._rl, referer=referer
+                url,
+                self._cfg.timeout,
+                rate_limiter=self._rl,
+                referer=referer,
+                max_size=self._cfg.max_file_size,
             )
             self._rl.on_success(url)
             path, chash = await self._store.save_binary(url, content, actual_ext, cat)
@@ -249,13 +259,14 @@ class CrawlEngine:
             await self._queue.mark_failed(url, result.error or "fetch failed")
             return
 
-        # If server returned binary without extension, re-queue for binary path
+        # If server returned binary content without a recognizable URL extension,
+        # switch to the binary download path directly (re-queueing would be a
+        # no-op: the URL is already in the DB and INSERT OR IGNORE silently drops it).
         ct = (result.metadata or {}).get("content_type", "") if result.metadata else ""
         if ct:
-            _, cat = classify_mime(ct)
+            mime_ext, cat = classify_mime(ct)
             if cat:
-                await self._queue.mark_failed(url, "binary content via MIME")
-                await self._queue.add(url, topic, depth)
+                await self._download_binary(url, mime_ext, cat, topic, referer)
                 return
 
         html = result.html or ""
@@ -300,11 +311,10 @@ class CrawlEngine:
                 ),
             )
 
-            new_urls = []
-            for abs_url in raw_links:
-                if not await self._queue.is_seen(abs_url):
-                    new_urls.append(abs_url)
-                    self._referers[abs_url] = base_url  # track navigation chain
+            seen = await self._queue.is_seen_many(raw_links)
+            new_urls = [u for u in raw_links if u not in seen]
+            for abs_url in new_urls:
+                self._referers[abs_url] = base_url  # track navigation chain
 
             if new_urls:
                 added = await self._queue.add_many(new_urls, topic, depth + 1)

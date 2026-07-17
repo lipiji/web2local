@@ -11,7 +11,7 @@ import logging
 import random
 import time
 from collections import defaultdict
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
@@ -48,7 +48,8 @@ def _gauss_clamp(min_s: float, max_s: float) -> float:
         return min_s
     mean = (min_s + max_s) / 2
     std = (max_s - min_s) / 4
-    return max(min_s, min(max_s, random.gauss(mean, std)))
+    # Request pacing jitter, not security-sensitive randomness
+    return max(min_s, min(max_s, random.gauss(mean, std)))  # nosec B311
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +124,8 @@ class HeaderBuilder:
         if self._ua_gen:
             try:
                 return self._ua_gen.random
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("fake-useragent lookup failed, using fallback UA: %s", exc)
         return _FALLBACK_UA
 
     def build(
@@ -135,11 +136,12 @@ class HeaderBuilder:
         ua: Optional[str] = None,
     ) -> dict[str, str]:
         ua = ua or self.random_ua()
-        brand, _ = random.choice(_CHROME_BRANDS)
+        # Header rotation, not security-sensitive randomness
+        brand, _ = random.choice(_CHROME_BRANDS)  # nosec B311
         headers: dict[str, str] = {
             "User-Agent": ua,
             "Accept": "*/*" if binary else _ACCEPT_HTML,
-            "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+            "Accept-Language": random.choice(_ACCEPT_LANGUAGES),  # nosec B311
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
         }
@@ -180,7 +182,7 @@ async def with_retry(
     *,
     max_retries: int = 3,
     base_delay: float = 2.0,
-) -> any:
+) -> Any:
     """Retry with exponential backoff + ±50 % random jitter."""
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
@@ -193,7 +195,8 @@ async def with_retry(
             if not retriable or attempt == max_retries:
                 raise
             last_exc = exc
-            delay = min(base_delay * (2 ** attempt) + random.uniform(0.5, 2.0), 60.0)
+            # Backoff jitter, not security-sensitive randomness
+            delay = min(base_delay * (2 ** attempt) + random.uniform(0.5, 2.0), 60.0)  # nosec B311
             log.debug("Retry %d/%d in %.1fs (%s)", attempt + 1, max_retries, delay, name)
             await asyncio.sleep(delay)
     raise last_exc  # type: ignore[misc]

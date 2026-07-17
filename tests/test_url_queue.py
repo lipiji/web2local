@@ -91,3 +91,56 @@ async def test_queue_item_fields(queue):
 async def test_stats_empty_queue(queue):
     stats = await queue.stats()
     assert stats == {}
+
+
+async def test_is_seen_many_returns_only_known_urls(queue):
+    await queue.add("https://known1.com", "test", 0)
+    await queue.add("https://known2.com", "test", 0)
+    result = await queue.is_seen_many(
+        ["https://known1.com", "https://known2.com", "https://unknown.com"]
+    )
+    assert result == {"https://known1.com", "https://known2.com"}
+
+
+async def test_is_seen_many_empty_input(queue):
+    assert await queue.is_seen_many([]) == set()
+
+
+async def test_get_batch_diverse_claims_each_url_exactly_once(queue):
+    urls = [f"https://site{i}.com" for i in range(30)]
+    await queue.add_many(urls, "test", 0)
+
+    first = await queue.get_batch_diverse(20)
+    second = await queue.get_batch_diverse(20)
+
+    first_urls = {item.url for item in first}
+    second_urls = {item.url for item in second}
+    assert first_urls.isdisjoint(second_urls), "Same URL claimed by two batches"
+    assert len(first_urls) + len(second_urls) == 30
+
+
+async def test_get_batch_diverse_marks_claimed_rows_in_progress(queue):
+    await queue.add_many([f"https://a{i}.com" for i in range(10)], "test", 0)
+    batch = await queue.get_batch_diverse(5)
+    stats = await queue.stats()
+    assert len(batch) == 5
+    assert stats.get("in_progress", 0) == 5
+    assert stats.get("pending", 0) == 5
+
+
+async def test_initialize_resets_stale_in_progress_rows(tmp_path):
+    db_path = tmp_path / "resume.db"
+    q1 = URLQueue(db_path)
+    await q1.initialize()
+    await q1.add("https://stuck.com", "test", 0)
+    await q1.get_batch(1)  # claims it -> in_progress
+    stats = await q1.stats()
+    assert stats.get("in_progress", 0) == 1
+    await q1.close()  # simulate crash: no mark_success/mark_failed ever called
+
+    q2 = URLQueue(db_path)
+    await q2.initialize()  # should reset the stale in_progress row
+    stats2 = await q2.stats()
+    await q2.close()
+    assert stats2.get("in_progress", 0) == 0
+    assert stats2.get("pending", 0) == 1

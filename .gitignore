@@ -49,3 +49,10 @@ ms-playwright/
 # Logs
 *.log
 logs/
+
+# Ad-hoc scan/report output (bandit, pip-audit, etc.) - regenerate, don't commit
+/reports/
+bandit_report.txt
+pip_audit_report.json
+pip_audit_stderr.txt
+*_stderr.txt

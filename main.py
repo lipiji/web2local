@@ -12,11 +12,16 @@ import click
 from dotenv import load_dotenv
 
 from config import Config
+from crawler.downloader import close_all_sessions
 from crawler.engine import CrawlEngine
 from url_queue.url_queue import URLQueue
 from storage.local_store import LocalStore
 
 load_dotenv()
+
+# Evaluated once, after load_dotenv(), so CLI defaults reflect W2L_* env vars.
+# Explicit CLI flags still take precedence over these defaults.
+_env_cfg = Config.from_env()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,17 +38,17 @@ def cli() -> None:
 
 @cli.command()
 @click.argument("keyword")
-@click.option("--output", "-o", default="./data", show_default=True, help="Output directory")
-@click.option("--depth", "-d", default=3, show_default=True, help="Max BFS depth")
-@click.option("--max-pages", "-n", default=1000, show_default=True, help="Max pages to save")
-@click.option("--concurrency", "-c", default=10, show_default=True, help="Concurrent requests")
-@click.option("--search-results", default=20, show_default=True, help="Seed URLs from search")
-@click.option("--db", default="./crawl.db", show_default=True, help="SQLite queue database")
-@click.option("--follow-links/--no-follow-links", default=True, show_default=True)
-@click.option("--same-domain/--all-domains", default=False, show_default=True)
-@click.option("--min-delay", default=1.5, show_default=True,
+@click.option("--output", "-o", default=str(_env_cfg.output_dir), show_default=True, help="Output directory")
+@click.option("--depth", "-d", default=_env_cfg.max_depth, show_default=True, help="Max BFS depth")
+@click.option("--max-pages", "-n", default=_env_cfg.max_pages, show_default=True, help="Max pages to save")
+@click.option("--concurrency", "-c", default=_env_cfg.concurrency, show_default=True, help="Concurrent requests")
+@click.option("--search-results", default=_env_cfg.search_max_results, show_default=True, help="Seed URLs from search")
+@click.option("--db", default=str(_env_cfg.db_path), show_default=True, help="SQLite queue database")
+@click.option("--follow-links/--no-follow-links", default=_env_cfg.follow_links, show_default=True)
+@click.option("--same-domain/--all-domains", default=_env_cfg.same_domain_only, show_default=True)
+@click.option("--min-delay", default=_env_cfg.min_delay, show_default=True,
               help="Min seconds between requests to same domain (Gaussian lower bound)")
-@click.option("--max-delay", default=5.0, show_default=True,
+@click.option("--max-delay", default=_env_cfg.max_delay, show_default=True,
               help="Max seconds between requests to same domain (Gaussian upper bound)")
 def crawl(
     keyword: str,
@@ -66,6 +71,8 @@ def crawl(
         max_pages=max_pages,
         concurrency=concurrency,
         search_max_results=search_results,
+        arxiv_max_results=_env_cfg.arxiv_max_results,
+        max_file_size=_env_cfg.max_file_size,
         follow_links=follow_links,
         same_domain_only=same_domain,
         min_delay=min_delay,
@@ -115,6 +122,7 @@ async def _run(keyword: str, config: Config) -> None:
             click.echo(f"  {s:<15} {n}")
     finally:
         await queue.close()
+        await close_all_sessions()
 
 
 async def _show_status(db_path: Path) -> None:

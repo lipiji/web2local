@@ -31,6 +31,11 @@ python -m pytest tests/ -v
 # Lint / format
 ruff check .
 ruff format .
+
+# Security scans (bandit config lives in pyproject.toml, excludes tests/)
+# Write output under reports/ (gitignored) - never as loose files in repo root
+mkdir -p reports && bandit -r . -x ./tests,./.venv -o reports/bandit_report.txt
+mkdir -p reports && pip-audit -r requirements.txt -f json -o reports/pip_audit_report.json
 ```
 
 ## Architecture

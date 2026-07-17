@@ -4,9 +4,12 @@ Binary file downloader:
 - Realistic browser headers via HeaderBuilder
 - Per-domain rate limiting + adaptive backoff
 - cloudscraper fallback on Cloudflare 403/503
+- Streaming download with a hard size cap to avoid unbounded memory use
 """
 
+import asyncio
 import logging
+import random as _random
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -19,6 +22,8 @@ from crawler.stealth import (
 )
 
 log = logging.getLogger(__name__)
+
+DEFAULT_MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024  # 200 MB
 
 _MIME_TO_EXT: dict[str, str] = {
     "application/pdf": ".pdf",
@@ -46,25 +51,43 @@ _header_builder = HeaderBuilder()
 
 # Shared sessions: one per impersonation target, created lazily
 _sessions: dict[str, "AsyncSession"] = {}  # type: ignore[type-arg]
-_sessions_lock: "asyncio.Lock | None" = None
+_sessions_lock = asyncio.Lock()
 
 
-def _get_sessions_lock():
-    import asyncio
-    global _sessions_lock
-    if _sessions_lock is None:
-        _sessions_lock = asyncio.Lock()
-    return _sessions_lock
+class DownloadError(Exception):
+    """Non-2xx HTTP response. Carries status_code for retry/backoff logic."""
+
+    def __init__(self, status_code: int, url: str) -> None:
+        super().__init__(f"HTTP {status_code} from {url}")
+        self.status_code = status_code
+        self.url = url
+
+    @property
+    def response(self) -> "DownloadError":
+        # Lets existing retry/backoff code do getattr(exc, "response").status_code
+        return self
+
+
+class DownloadTooLargeError(Exception):
+    """Raised when a response body exceeds the configured size limit."""
 
 
 async def _get_session(impersonate: str):
     """Return a shared AsyncSession for the given impersonation target."""
     if impersonate not in _sessions:
-        async with _get_sessions_lock():
+        async with _sessions_lock:
             if impersonate not in _sessions:
                 from curl_cffi.requests import AsyncSession  # type: ignore[import]
                 _sessions[impersonate] = AsyncSession(impersonate=impersonate)
     return _sessions[impersonate]
+
+
+async def close_all_sessions() -> None:
+    """Close all pooled curl_cffi sessions. Call once at process shutdown."""
+    async with _sessions_lock:
+        for session in _sessions.values():
+            await session.close()
+        _sessions.clear()
 
 
 def url_ext(url: str) -> str:
@@ -95,42 +118,55 @@ def _is_cloudflare(status: int, body: bytes) -> bool:
     )
 
 
-import random as _random
-
-
 async def download_binary(
     url: str,
     timeout: int = 30,
     rate_limiter: Optional[AdaptiveDomainRateLimiter] = None,
     referer: Optional[str] = None,
+    max_size: int = DEFAULT_MAX_DOWNLOAD_SIZE,
 ) -> tuple[bytes, str, str]:
     """
     Download a binary file.
     Strategy: shared curl_cffi session (TLS impersonation) → cloudscraper fallback.
+    Streams the body and aborts once `max_size` bytes have been received.
     Returns (content_bytes, resolved_ext, content_type_header).
     """
     if rate_limiter:
         await rate_limiter.wait(url)
 
-    impersonate = _random.choice(_IMPERSONATE_POOL)
+    # TLS-fingerprint rotation, not security-sensitive randomness
+    impersonate = _random.choice(_IMPERSONATE_POOL)  # nosec B311
     headers = _header_builder.build(binary=True, referer=referer)
 
     async def _fetch() -> tuple[bytes, str, str]:
         session = await _get_session(impersonate)
-        resp = await session.get(
-            url, headers=headers, timeout=timeout, allow_redirects=True
-        )
-        body = resp.content
-        status = resp.status_code
+        chunks: list[bytes] = []
+        total = 0
+        async with session.stream(
+            "GET", url, headers=headers, timeout=timeout, allow_redirects=True
+        ) as resp:
+            status = resp.status_code
+            content_length = resp.headers.get("content-length")
+            if content_length and int(content_length) > max_size:
+                raise DownloadTooLargeError(
+                    f"Content-Length {content_length} exceeds max_size={max_size} for {url}"
+                )
+            async for chunk in resp.aiter_content():
+                total += len(chunk)
+                if total > max_size:
+                    raise DownloadTooLargeError(
+                        f"Download exceeded max_size={max_size} bytes: {url}"
+                    )
+                chunks.append(chunk)
+            ct = resp.headers.get("content-type", "")
+        body = b"".join(chunks)
 
         if _is_cloudflare(status, body):
             log.debug("Cloudflare block on %s — cloudscraper fallback", url)
             body = await cloudscraper_get(url, headers, timeout)
             ct = ""
-        else:
-            if status >= 400:
-                raise Exception(f"HTTP {status} from {url}")
-            ct = resp.headers.get("content-type", "")
+        elif status >= 400:
+            raise DownloadError(status, url)
 
         ext_from_mime, _ = classify_mime(ct)
         ext = ext_from_mime or url_ext(url) or ".bin"

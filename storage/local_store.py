@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import re
@@ -23,10 +24,10 @@ def _url_to_filename(url: str, ext: str) -> str:
     return safe + ext
 
 
-def _md5(data: bytes | str) -> str:
+def _content_hash(data: bytes | str) -> str:
     if isinstance(data, str):
         data = data.encode("utf-8", errors="replace")
-    return hashlib.md5(data).hexdigest()
+    return hashlib.sha256(data).hexdigest()
 
 
 class LocalStore:
@@ -34,6 +35,9 @@ class LocalStore:
         self._base = base_dir / _slugify(topic)
         self._date = datetime.now(UTC).strftime("%Y%m%d")
         self._meta_file = self._base / "metadata.jsonl"
+        # Guards metadata.jsonl appends: concurrent workers writing the same
+        # file with plain aiofiles "a" mode can interleave partial lines.
+        self._meta_lock = asyncio.Lock()
 
     def _category_dir(self, category: str) -> Path:
         d = self._base / self._date / category
@@ -51,7 +55,7 @@ class LocalStore:
         self, url: str, html: str, text: str = ""
     ) -> tuple[Path, str]:
         """Save HTML + optional extracted text. Returns (path, content_hash)."""
-        chash = _md5(html)
+        chash = _content_hash(html)
         d = self._category_dir("html")
         path = self._unique_path(d, _url_to_filename(url, ".html"), chash)
         async with aiofiles.open(path, "w", encoding="utf-8", errors="replace") as f:
@@ -66,7 +70,7 @@ class LocalStore:
         self, url: str, content: bytes, ext: str, category: str
     ) -> tuple[Path, str]:
         """Save a binary file (PDF, DOCX, image, …). Returns (path, content_hash)."""
-        chash = _md5(content)
+        chash = _content_hash(content)
         d = self._category_dir(category)
         path = self._unique_path(d, _url_to_filename(url, ext), chash)
         async with aiofiles.open(path, "wb") as f:
@@ -75,7 +79,7 @@ class LocalStore:
 
     async def save_text(self, url: str, content: str) -> tuple[Path, str]:
         """Save plain text content. Returns (path, content_hash)."""
-        chash = _md5(content)
+        chash = _content_hash(content)
         d = self._category_dir("txt")
         path = self._unique_path(d, _url_to_filename(url, ".txt"), chash)
         async with aiofiles.open(path, "w", encoding="utf-8", errors="replace") as f:
@@ -85,5 +89,7 @@ class LocalStore:
     async def log_metadata(self, record: dict) -> None:
         """Append one JSON record to the topic's metadata.jsonl."""
         self._meta_file.parent.mkdir(parents=True, exist_ok=True)
-        async with aiofiles.open(self._meta_file, "a", encoding="utf-8") as f:
-            await f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        async with self._meta_lock:
+            async with aiofiles.open(self._meta_file, "a", encoding="utf-8") as f:
+                await f.write(line)

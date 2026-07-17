@@ -23,7 +23,19 @@ EXT_CATEGORY: dict[str, str] = {
     ".jpg": "images", ".jpeg": "images", ".png": "images",
     ".gif": "images", ".webp": "images", ".bmp": "images",
     ".tiff": "images", ".svg": "images",
+    ".zip": "archive", ".tar": "archive", ".gz": "archive", ".7z": "archive",
+    ".mp4": "media", ".mp3": "media", ".wav": "media", ".avi": "media",
 }
+
+# Every BINARY_EXTENSIONS entry must resolve to a category, otherwise
+# classify_url() falls through to (None, None) and the URL gets crawled
+# as HTML instead of downloaded as a binary file. Raise (not assert) so this
+# invariant still holds under `python -O`, which strips assert statements.
+if not BINARY_EXTENSIONS <= EXT_CATEGORY.keys():
+    raise ValueError(
+        "BINARY_EXTENSIONS has entries missing from EXT_CATEGORY: "
+        f"{BINARY_EXTENSIONS - EXT_CATEGORY.keys()}"
+    )
 
 
 @dataclass
@@ -35,6 +47,8 @@ class Config:
     concurrency: int = 10
     timeout: int = 30
     search_max_results: int = 20
+    arxiv_max_results: int = 20
+    max_file_size: int = 200 * 1024 * 1024  # 200 MB cap on binary/HTML downloads
     follow_links: bool = True
     same_domain_only: bool = False
     # Human-like rate limiting: random delay between requests to same domain
@@ -66,6 +80,8 @@ class Config:
             concurrency=int(os.getenv("W2L_CONCURRENCY", "10")),
             timeout=int(os.getenv("W2L_TIMEOUT", "30")),
             search_max_results=int(os.getenv("W2L_SEARCH_MAX_RESULTS", "20")),
+            arxiv_max_results=int(os.getenv("W2L_ARXIV_MAX_RESULTS", "20")),
+            max_file_size=int(os.getenv("W2L_MAX_FILE_SIZE", str(200 * 1024 * 1024))),
             follow_links=os.getenv("W2L_FOLLOW_LINKS", "true").lower() == "true",
             same_domain_only=os.getenv("W2L_SAME_DOMAIN_ONLY", "false").lower() == "true",
             min_delay=float(os.getenv("W2L_MIN_DELAY", "1.5")),
